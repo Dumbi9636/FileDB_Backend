@@ -1,6 +1,9 @@
 package com.example.filedb.repository;
 
 import java.io.File;
+import java.io.RandomAccessFile;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.file.Files; // 파일/디렉토리 생성, 존재 여부 확인
 import java.nio.file.Path;  // 파일/디렉토리 경로 표현
 import java.nio.file.Paths; // 문자열로부터 Path 객체 생성
@@ -20,11 +23,11 @@ import com.fasterxml.jackson.databind.ObjectMapper; // JSON <-> 객체 변환 �
 import lombok.RequiredArgsConstructor;
 // Repository 에서 해야할 작업
 /*
-	1. JSON 파일로 저장
-	2. 게시글 ID 생성 (시퀀스 파일)
-	3. 파일 락 처리
-	4. 게시글 목록 가져오기
-	5. 키워드 검색 (파일 다 읽어서 필터링)
+	1. JSON 파일로 저장 <작업 ㅇ>
+	2. 게시글 ID 생성 (시퀀스 파일 포함) <작업 ㅇ>
+	3. 파일 락 처리 
+	4. 게시글 목록 가져오기 <작업 ㅇ>
+	5. 키워드 검색 (파일 필터링) <작업 ㅇ>
  */
 
 
@@ -45,69 +48,108 @@ public class FilePostRepository {
 	// 디렉토리명 교체 시 유지보수를 위해...
 	private static final String POSTS_DIR_NAME = "posts";
 	
+	// ===== 동시성 제어용 Lock 객체 =====
+	// 게시글 데이터 파일에 대한 Lock
+	private final Object postLock = new Object();
+	
+	// 시퀀스 파일에 대한 Lock
+	private final Object sequenceLock = new Object();
+	
+	
+	
+	
 	// 1. 게시글 저장 
+	/* - ID 가 없으면 시퀀스로 새 ID 발급 후 {id}.json 으로 저장
+	 * - ID 가 있으면 같은 파일명을 가진 JSON을 덮어써서 수정
+	 */
 	public PostDto save(PostDto post) {
-		try {
-			// ID 가 없으면 새로 생성 (INSERT)
-			// 이미 ID 가 있다면 해당 ID 로 덮어쓰기(UPDATE) 
-			if(post.getId()== null) {
-				post.setId(getNextId());
+		//게시글 파일에 대한 동시성 제어
+		synchronized (postLock) { 
+			try {
+				List<PostDto> posts = findAllPosts(); // 파일에서 전체 읽기
+				
+				// 새 게시글이면 ID 시퀀스에서 발급
+				if(post.getId()== null) {
+					// 새 게시글 -> 시퀀스에서 ID 발급
+					post.setId(getNextId());
+					posts.add(post);
+				}
+				
+				// /data/posts/ 디렉토리 경로 생성
+				Path postDir = Paths.get(basePath, POSTS_DIR_NAME);
+				Files.createDirectories(postDir);
+				
+				// 게시글이 저장될 파일 경로 생성: ./data/posts/title.json
+				File file = postDir.resolve(post.getId()+".json").toFile();
+				
+				// 게시글 객체를 포맷된 JSON 파일로 저장
+				objectMapper.writerWithDefaultPrettyPrinter().writeValue(file, post);
+				
+				// 저장완료된 객체 반환 
+				return post;
+				
+			}catch(Exception e) {
+				throw new RuntimeException("파일 저장 오류", e);
 			}
-			// /data/posts/ 디렉토리 경로 생성
-			Path postDir = Paths.get(basePath, POSTS_DIR_NAME);
-			Files.createDirectories(postDir);
-			
-			// 게시글이 저장될 파일 경로 생성 
-			// ./data/posts/title.json
-			File file = postDir.resolve(post.getId()+".json").toFile();
-			
-			// 게시글 객체를 포맷된 JSON 파일로 저장
-			objectMapper.writerWithDefaultPrettyPrinter().writeValue(file, post);
-			
-			// 저장완료된 객체 반환 
-			return post;
-			
-		}catch(Exception e) {
-			throw new RuntimeException("파일 저장 오류", e);
 		}
 	}
 	
 	// 2. ID 시퀀스 생성
+	/* - sequence.json 파일에 대해 동시성 제어 적용
+	 * - sequenceLock 으로 JVM 내부 동시성 제어
+	 * - FileChannel + FileLock 으로 OS 레밸 파일락 고려
+	 */
 	private Long getNextId() {
-		try {
-			// 시퀀스를 저장할 파일 경로
-			// ./data/sequences.json
-			Path seqFile = Paths.get(basePath, "sequences.json");
-			
-			// 파일이 들어있는 상위 폴더(Path)를 가져올 수 있도록 디렉토리 생성
-			Files.createDirectories(seqFile.getParent());
-			
-			// JSON 읽어서 사용할 Map
-			Map<String, Long> map;
-			if(Files.exists(seqFile)) {
-				// 파일이 이미 있으면 JSON 내용을 Map<String, Long> 형태로 읽어오기
-				// { "post": 3 }
-				map = objectMapper.readValue(seqFile.toFile(), Map.class);
-			}else {
-				// 파일이 없다면 기본값 세팅
-				map = new HashMap<>();
-				// 아무 글도 게시되지 않았으니 0부터 시작하도록
-				map.put("post", 0L);
-			}
-			
-			// "post" 키에 해당하는 값에 1 더해서 다음 ID 생성
-			Long next = map.get("post")+1;
-			
-			// 갱신된 값 저장
-			map.put("post", next);
-			
-			// 변경된 시퀀스 맵을 다시 sequences.json 파일에 저장
-			objectMapper.writerWithDefaultPrettyPrinter().writeValue(seqFile.toFile(), map);
-			
-			// 새로 생성된 ID 반환 
-			return next;
-		}catch(Exception e) {
-			throw new RuntimeException("시퀀스 생성 오류", e);
+		// JVM 내부 동시성 제어
+		synchronized (sequenceLock) {
+			try {
+				// 시퀀스를 저장할 파일 경로: ./data/sequences.json
+				Path seqPath = Paths.get(basePath, "sequences.json");
+				File seqFile = seqPath.toFile();
+				
+				// 파일이 들어있는 상위 폴더(Path)를 가져올 수 있도록 디렉토리 생성
+	            Files.createDirectories(seqPath.getParent());
+	            
+	            // 파일이 없으면 먼저 빈 파일 생성
+	            if (!seqFile.exists()) {
+	                seqFile.createNewFile();
+	            }
+				
+	            // OS 레벨 파일 락
+	            try (RandomAccessFile raf = new RandomAccessFile(seqFile, "rw");
+	                 FileChannel channel = raf.getChannel();
+	                 FileLock lock = channel.lock()) {
+	
+	                // === 여기부터는 OS + JVM 둘 다 lock 이 잡힌 상태 ===
+	                // 현재 시퀀스 값 읽기
+	                Map<String, Object> map;
+	                // 파일이 비어있지 않다면 JSON 읽기
+	                if (seqFile.length() > 0) {
+	                    map = objectMapper.readValue(seqFile, Map.class);
+	                } else {
+	                	// 파일이 비어있으면 기본값 세팅
+	                    map = new HashMap<>();
+	                    map.put("post", 0L);
+	                }
+	                
+	                // 기존 시퀀스 값 읽기 (파일이 Number 또는 Integer 로 저장될 수 있으므로 Object 로 캐스팅)
+	                Object raw = map.getOrDefault("post", 0);
+	                long current = (raw instanceof Number) ? ((Number) raw).longValue() : 0L;
+	                
+	                // 다음 ID 생성
+	                long next = current + 1;
+	                map.put("post", next);
+	
+	                // 변경된 시퀀스 값을 파일에 다시 저장 
+	                objectMapper.writerWithDefaultPrettyPrinter()
+	                        .writeValue(seqFile, map);
+	                
+	                // 새로운 ID 반환
+	                return next;
+	            }
+	        } catch (Exception e) {
+	            throw new RuntimeException("시퀀스 생성 오류", e);
+	        }
 		}
 	}
 	
@@ -168,12 +210,25 @@ public class FilePostRepository {
     }
 
     // 5. 삭제
+    /* ./data/posts/{id}.json 파일 삭제
+     * 쓰기(삭제) 작업만 postLock 으로 보호
+     */ 
     public void deletePostById(Long id) {
-    	// 삭제 대상 파일 경로
-        File file = Paths.get(basePath, POSTS_DIR_NAME, id + ".json").toFile();
-        
-        // 파일 존재하면 실제 파일 시스템에서 삭제(물리)
-        if (file.exists()) file.delete();
+    	synchronized (postLock) {
+    		try {
+                // 삭제 대상 파일 경로: ./data/posts/{id}.json
+                File file = Paths.get(basePath, POSTS_DIR_NAME, id + ".json").toFile();
+                
+                // 파일이 존재하면 삭제
+                if (file.exists()) {
+                    if (!file.delete()) {
+                        throw new RuntimeException("파일 삭제 실패: " + file.getAbsolutePath());
+                    }
+                }
+            } catch (Exception e) {
+                throw new RuntimeException("파일 삭제 오류", e);
+            }
+	    }
     }
     
     
