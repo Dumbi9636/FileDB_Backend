@@ -42,7 +42,7 @@ public class PostService {
 		request.setUpdatedAt(now);
 		
 		// ID 는 Repositroy 에서 시퀀스로 채우기
-		return postRepository.save(request);
+		return postRepository.create(request);
 	}
 	
 	
@@ -62,7 +62,7 @@ public class PostService {
 		existing.setUpdatedAt(LocalDateTime.now().format(DATE_TIME_FORMATTER));
 		
 		// 다시 저장
-		return postRepository.save(existing);
+		return postRepository.update(existing);
 	}
 	
 	
