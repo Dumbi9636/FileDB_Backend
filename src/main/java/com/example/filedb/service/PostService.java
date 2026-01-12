@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.UUID;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -12,9 +13,11 @@ import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 import com.example.filedb.dto.PostDto;
+import com.example.filedb.dto.PostMetaDto;
 import com.example.filedb.dto.PostPageResponse;
 import com.example.filedb.exception.PostNotFoundException;
 import com.example.filedb.repository.FilePostRepository;
+import com.example.filedb.repository.PostMetaIndexRepository;
 
 import lombok.RequiredArgsConstructor;
 
@@ -24,6 +27,7 @@ public class PostService {
 	
 	// 의존성 주입
 	private final FilePostRepository postRepository;
+	private final PostMetaIndexRepository postMetaIndexRepository;
 	
 	// 날짜는 String 으로 저장
 	private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
@@ -62,7 +66,7 @@ public class PostService {
 		existing.setUpdatedAt(LocalDateTime.now().format(DATE_TIME_FORMATTER));
 		
 		// 다시 저장
-		return postRepository.update(existing);
+		return postRepository.updateContent(existing);
 	}
 	
 	
@@ -73,200 +77,126 @@ public class PostService {
 	}
 	
 	
-	// 4. 전체 게시글 목록 조회
-	public List<PostDto> getAllPosts(){
-		return postRepository.findAllPosts();
-	}
-	
-	
-	// 5. 키워드 검색(제목+내용)
-	public List<PostDto> searchPosts(String keyword) {
-		// 키워드를 입력하지 않으면 전체 목록 반환
-	    if (keyword == null || keyword.isBlank()) {
-	        return getAllPosts();
-	    }
-	    // searchPosts 메소드를 이용해서 키워드 검색 후 반환
-	    return postRepository.searchPosts(keyword);
-	}
-	
-	
-	// 6. 게시글 삭제
+	// 4. 게시글 삭제
     public void deletePost(Long postId) {
-        // ID 가 없다면 Post 예외 던지기
-        if (postRepository.findPostById(postId).isEmpty()) {
-            throw new PostNotFoundException(postId);
-        }
-        // 있다면 ID 를 이용해서 삭제
-        postRepository.deletePostById(postId);
+    	postRepository.findPostById(postId)
+    		.orElseThrow(() -> new PostNotFoundException(postId));
+		postRepository.deletePostById(postId);
+
     }
-    
-    
-    // 7. 게시글 이미지 업로드 처리
-    // 파일을 {id}.확장자 형태로 저장
-    // 저장된 경로를 PostDto.imagePath 에 반영 후, 게시글 저장
-    public PostDto uploadPostImage(Long id, MultipartFile file) {
+
+
+    // 5. 검색 결과 페이징 (메타 인덱스 기반)
+    // id 의 경우 inverted index 에서 최신순으로 정렬되어 반환
+    public PostPageResponse<PostMetaDto> searchPostsPage(String keyword, int page, int size) {
+    	page = Math.max(page, 0);
+    	size = (size <= 0) ? 10 : size;
+    	keyword = (keyword == null) ? "" : keyword.trim();
     	
-    	// 게시글 존재 여부 확인, 없으면 PostNotFoundExcetpion
-    	PostDto post = postRepository.findPostById(id)
-    			.orElseThrow(()-> new PostNotFoundException(id));
-    	
-    	// 업로드할 파일이 비어있는지 검증
-    	if(file == null || file.isEmpty()) {
-    		throw new IllegalArgumentException("업로드할 파일이 없습니다.");
-    	}
-    	
-    	// 원본 파일명에서 확장자 추출
-    	String originalName = file.getOriginalFilename();
-    	String extension = "";
-    	
-    	if(originalName != null && originalName.lastIndexOf(".") != -1) {
-    		extension = originalName.substring(originalName.lastIndexOf("."));
-    	}
-    	
-    	// 확장자가 없는 경우 기본 확장자 부여
-    	if(extension.isBlank()) {
-    		extension = ".dat";
-    	}
-    	
-    	// 저장할 파일명: {id}.확장자
-    	String savedFileName = id + extension;
-    	
-    	// 업로드 디렉토리 생성(절대경로)
-    	File dir = new File(uploadPath).getAbsoluteFile();
-    	if(!dir.exists()) {
-    		boolean created = dir.mkdirs();
-    		if(!created) {
-    			throw new RuntimeException("이미지 저장 폴더를 생성할 수 없습니다");
-    		}
-    	}
-    	
-    	// 실제 저장될 파일 객체 생성
-    	File dest = new File(dir, savedFileName);
-    	try {
-    		file.transferTo(dest);
-    	}catch(IOException e) {
-    		e.printStackTrace();
-    		throw new RuntimeException("이미지 파일 저장 중 오류가 발생했습니다.");
-    	}
-    	
-    	// 게시글 DTO 에 이미지 경로 세팅
-    	// WebConfig 에서 /images/** -> uploadPath 로 매핑함
-    	post.setImagePath("/images/" + savedFileName);
-    	
-    	// 수정 시간 갱신 후 게시글 다시 저장
-    	post.setUpdatedAt(LocalDateTime.now().format(DATE_TIME_FORMATTER));
-    	return postRepository.save(post);
-    }
-    
-    
-    // 8. 내부 공통 유틸: List<PostDto> -> PostPageResponse 로 변환
-    /*
-     *  - 전체/검색 결과에 공통으로 사용되는 페이징 처리
-     *  - DB 없는 파일 기반으로 메모리 리스트를 자르는 방식으로 페이징 구현 
-     */
-    private PostPageResponse slicePage(List<PostDto> source, int page, int size) {
-        // page, size 기본값/이상치 보정
-        if (page < 0) page = 0;
-        if (size <= 0) size = 10;
-        
-        // 전체 데이터 개수
-        int totalElements = source.size();
-        // 전체 페이지 수
-        int totalPages = (totalElements == 0) ? 0
-                : (int) Math.ceil((double) totalElements / size);
-        
-        // 자르기 시작 지점 계산
-        int fromIndex = page * size;
-        
-        // 시작 인덱스가 전체 개수보다 크다면 빈 페이지 반환
-        if (fromIndex >= totalElements) {
-            // 범위를 넘어가면 빈 페이지 반환
-            return PostPageResponse.builder()
+    	if (keyword.isBlank()) {
+            return PostPageResponse.<PostMetaDto>builder()
                     .page(page)
                     .size(size)
-                    .totalElements(totalElements)
+                    .totalElements(0)
+                    .totalPages(0)
+                    .content(List.of())
+                    .build();
+        }
+        // 검색 인덱스로 ID만 조회 
+        List<Long> ids = postRepository.searchPostIds(keyword);
+        // 이 메서드는 invertedIndexRepository.searchIds()만 감싼 것
+        int total = ids.size();
+        int totalPages = (total == 0) ? 0 : (int) Math.ceil((double) total / size);
+
+        int from = page * size;
+        if (from >= total) {
+            return PostPageResponse.<PostMetaDto>builder()
+                    .page(page)
+                    .size(size)
+                    .totalElements(total)
                     .totalPages(totalPages)
                     .content(List.of())
                     .build();
         }
+        int to = Math.min(from + size, total);
+        List<Long> pageIds = ids.subList(from, to);
         
-        // 종료 지점
-        int toIndex = Math.min(fromIndex + size, totalElements);
-        
-        // 실제 page 범위에 해당하는 데이터 자르기
-        List<PostDto> content = source.subList(fromIndex, toIndex);
-        
-        // 페이징 응답 DTO 생성
-        return PostPageResponse.builder()
+        // ID → 메타만 조회 (본문 JSON x)
+        List<PostMetaDto> metas = postMetaIndexRepository.findByIds(pageIds);
+
+        return PostPageResponse.<PostMetaDto>builder()
                 .page(page)
                 .size(size)
-                .totalElements(totalElements)
+                .totalElements(total)
                 .totalPages(totalPages)
-                .content(content)
+                .content(metas)
+                .build();
+    }
+
+    
+    
+    // 6. 전체 목록 페이징
+    // - 목록 인덱스에서 page, size 가져온 뒤 페이징 처리
+    public PostPageResponse<PostMetaDto> getPostsPage(int page, int size) {
+
+    	page = Math.max(page, 0);
+    	size = (size <= 0) ? 10 : size;
+
+    	// 인덱스에서 page 수 가져오기
+    	List<PostMetaDto> metas = postMetaIndexRepository.findPage(page, size);
+    	int total = postMetaIndexRepository.count();
+        int totalPages = (total == 0) ? 0 : (int) Math.ceil((double) total / size);
+
+        return PostPageResponse.<PostMetaDto>builder()
+                .page(page)
+                .size(size)
+                .totalElements(total)
+                .totalPages(totalPages)
+                .content(metas)
                 .build();
     }
     
-    // 9. 검색 결과 페이징
-    // - 검색 수행 후 결과 리스트 페이징 처리
-    public PostPageResponse searchPostsPage(String keyword, int page, int size) {
-    	List<PostDto> result = searchPosts(keyword);
-        return slicePage(result, page, size);
-    }
     
-    
-    // 10. 전체 목록 페이징
-    // - 전체 목록을 가져온 뒤 페이징 처리
-    public PostPageResponse getPostsPage(int page, int size) {
-    	List<PostDto> all = getAllPosts();
-    	return slicePage(all, page, size);
-    }
-    
-    // 11. UI 에디터 이미지 업로드 
+    // 7. UI 에디터 이미지 업로드 
     public String uploadEditorImage(MultipartFile file) {
         if (file == null || file.isEmpty()) {
             throw new IllegalArgumentException("업로드할 파일이 없습니다.");
         }
-
+        
+        // 원본 파일명에서 확장자 추출
+        String contentType = file.getContentType();
+        if (contentType == null || !contentType.startsWith("image/")) {
+            throw new IllegalArgumentException("이미지 파일만 업로드할 수 있습니다.");
+        }
+        
         // 업로드 디렉토리: application.properties의 filedb.upload-path 값 사용
         File dir = new File(uploadPath, "editor").getAbsoluteFile();
-        if (!dir.exists()) {
-            boolean created = dir.mkdirs();
-            if (!created) {
-                throw new RuntimeException("에디터 이미지 저장 폴더를 생성할 수 없습니다.");
-            }
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw new RuntimeException("에디터 이미지 저장 폴더를 생성할 수 없습니다.");
         }
 
-        // 원본 파일명에서 확장자 추출
         String originalName = file.getOriginalFilename();
         String extension = "";
         if (originalName != null && originalName.lastIndexOf(".") != -1) {
-            extension = originalName.substring(originalName.lastIndexOf("."));
+            extension = originalName.substring(originalName.lastIndexOf(".")).toLowerCase();
         }
-        if (extension.isBlank()) {
-            extension = ".dat";
-        }
-
-        // 저장할 파일명: 현재시간-랜덤값.확장자
-        String savedFilename = System.currentTimeMillis() + "-" + Math.round(Math.random() * 100000) + extension;
-
-        // 실제 저장할 파일 객체
+        if (extension.isBlank()) extension = ".dat";
+        
+        // 파일 저장
+        String savedFilename = UUID.randomUUID() + extension;
         File dest = new File(dir, savedFilename);
 
         try {
             file.transferTo(dest);
         } catch (IOException e) {
-            e.printStackTrace();
             throw new RuntimeException("에디터 이미지 저장 중 오류 발생", e);
         }
 
-        // 절대 URL 생성 (http://localhost:9090/images/editor/xxxx.png)
-        String url = ServletUriComponentsBuilder
-                .fromCurrentContextPath()   // http://localhost:9090
+        return ServletUriComponentsBuilder
+                .fromCurrentContextPath()
                 .path("/images/editor/")
                 .path(savedFilename)
                 .toUriString();
-
-        return url;
     }
 
 }
